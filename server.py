@@ -395,7 +395,7 @@ def load_team_api(club_id, season_param):
         number = numbers.get(pid)
         players.append({
             "id": pid,
-            "name": p.get("displayName") or p.get("name") or "Unknown",
+            "name": p.get("name") or "Unknown",  # displayName is the full legal name ("Alisson Ramses Becker")
             "position": position or "Unknown",
             "group": group,
             "number": str(number) if number else "",
