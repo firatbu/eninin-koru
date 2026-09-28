@@ -23,11 +23,14 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PUBLIC = os.path.join(ROOT, "public")
 TM_BASE = "https://www.transfermarkt.com"
+# Transfermarkt's app API; still reachable from cloud hosts whose IPs the website blocks
+TM_API = "https://tmapi-alpha.transfermarkt.technology"
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -79,6 +82,10 @@ def _decode_body(raw, encoding):
     return raw.decode("utf-8", "replace")
 
 
+class TransfermarktBlocked(ApiError):
+    """The website refused this machine (hosting IPs get 403/405/429); the JSON API may still work."""
+
+
 def fetch_tm(path):
     status, body = http_request(
         TM_BASE + path,
@@ -86,11 +93,24 @@ def fetch_tm(path):
     )
     if status == 404:
         raise ApiError("Transfermarkt page not found (404). Check the link.", 404)
-    if status in (403, 429):
-        raise ApiError("Transfermarkt refused the request (HTTP %d). Wait a minute and retry." % status, 502)
+    if status in (403, 405, 429):
+        raise TransfermarktBlocked("Transfermarkt refused the request (HTTP %d). Wait a minute and retry." % status, 502)
     if status != 200:
         raise ApiError("Transfermarkt returned HTTP %d." % status, 502)
     return body
+
+
+def fetch_tm_api(path):
+    status, body = http_request(TM_API + path, headers={"Accept": "application/json"})
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        payload = None
+    if status == 404:
+        raise ApiError("Transfermarkt has no data for that club/season.", 404)
+    if status != 200 or not isinstance(payload, dict) or not payload.get("success"):
+        raise ApiError("Transfermarkt API returned HTTP %d." % status, 502)
+    return payload["data"]
 
 
 # --------------------------------------------------------------------------- Transfermarkt parsing
@@ -266,33 +286,150 @@ def load_team(url):
     with _cache_lock:
         if key in _cache:
             return _cache[key]
+    try:
+        team = load_team_html(slug, club_id, season_param)
+    except TransfermarktBlocked:
+        team = load_team_api(club_id, season_param)
+    with _cache_lock:
+        _cache[key] = team
+    return team
+
+
+def load_team_html(slug, club_id, season_param):
     path = "/%s/kader/verein/%s%s/plus/1" % (slug, club_id, "/saison_id/%s" % season_param if season_param else "")
     page = fetch_tm(path)
-    season, split_year = season_from_title(page)
-    if season_param:
-        season = int(season_param)
+    # the page title names the season as fans know it ("14/15", or "2013" for calendar-year leagues,
+    # whose saison_id is one lower); the id in the link only keys the team
+    season_year, split_year = season_from_title(page)
+    season = int(season_param) if season_param else season_year
     h1 = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.S)
     name = text_of(h1.group(1)) if h1 else slug.replace("-", " ").title()
     crest = re.search(r'<img src="(https://[^"]+/wappen/head/[^"]+)"', page)
     players = parse_players(page)
     try:
-        coach = find_coach(slug, club_id, season, split_year)
+        coach = find_coach(slug, club_id, season_year, split_year)
     except ApiError:
         coach = None  # squad is still usable without the manager
-    team = {
+    return {
         "id": "%s-%s" % (club_id, season),
         "clubId": club_id,
         "name": name,
         "season": season,
-        "seasonLabel": season_label(season, split_year) if season else "",
+        "seasonLabel": season_label(season_year, split_year) if season_year else "",
         "crest": html.unescape(crest.group(1)) if crest else None,
         "url": TM_BASE + path,
         "players": players,
         "coach": coach,
     }
-    with _cache_lock:
-        _cache[key] = team
-    return team
+
+
+API_GROUPS = {"GOALKEEPER": "GK", "DEFENDER": "DEF", "MIDFIELD": "MID", "FORWARD": "FWD"}
+GROUP_RANK = {"GK": 0, "DEF": 1, "MID": 2, "FWD": 3}
+
+
+def api_value_text(mv):
+    value = (mv or {}).get("value")
+    if not value:
+        return "-"
+    # same style as the website squad table: €15.00m, €800k
+    return "€%.2fm" % (value / 1e6) if value >= 1e6 else "€%dk" % round(value / 1e3)
+
+
+def api_season_value(player_id, season, cutoff, by_season):
+    """Market value for that season: the season's last valuation (Aug–May leagues, matches the
+    website), else the last valuation up to `cutoff` (calendar-year leagues, whose ids don't line up)."""
+    try:
+        history = fetch_tm_api("/player/%s/market-value-history" % player_id).get("history") or []
+    except ApiError:
+        return None
+    picked = [h for h in history if h.get("seasonId") == season] if by_season else []
+    if not picked:
+        picked = [h for h in history if (h.get("marketValue") or {}).get("determined", "9999") <= cutoff]
+    if not picked:
+        return None
+    return max(picked, key=lambda h: h["marketValue"].get("determined", ""))["marketValue"]
+
+
+def load_team_api(club_id, season_param):
+    club = fetch_tm_api("/club/%s" % club_id)
+    comp_id = (club.get("baseDetails") or {}).get("primaryCompetitionId")
+    try:
+        current = fetch_tm_api("/competition/%s" % comp_id).get("currentSeasonId") if comp_id else None
+    except ApiError:
+        current = None
+    today = dt.date.today()
+    split_now = today.year if today.month >= 7 else today.year - 1
+    # calendar-year leagues (MLS, Brasileirão, Allsvenskan…) lag one id behind: 2026 season = id 2025
+    split_year = current is None or current >= split_now
+    season = int(season_param) if season_param else (current or split_now)
+    season_end = "%d-06-30" % (season + 1) if split_year else "%d-12-31" % (season + 1)
+    cutoff = season_end if split_year else "%d-03-01" % (season + 1)  # calendar seasons start ~March
+    squad = fetch_tm_api("/club/%s/squad?season=%d" % (club_id, season)).get("squad") or []
+    if not squad:
+        raise ApiError("No players found for that club/season.", 502)
+    numbers = {str(s["playerId"]): s.get("shirtNumber") for s in squad}
+    ids = list(numbers)
+    details = {}
+    for i in range(0, len(ids), 50):
+        query = "&".join("ids[]=%s" % pid for pid in ids[i:i + 50])
+        for p in fetch_tm_api("/players?" + query):
+            details[str(p["id"])] = p
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        values = dict(zip(ids, pool.map(lambda pid: api_season_value(pid, season, cutoff, split_year), ids)))
+    ref_date = dt.date.fromisoformat(season_end)
+    players = []
+    for pid in ids:
+        p = details.get(pid)
+        if not p:
+            continue
+        attrs = p.get("attributes") or {}
+        position = (attrs.get("position") or {}).get("name") or ""
+        group = API_GROUPS.get(attrs.get("positionGroup")) or position_group(position, "")
+        dob = (p.get("lifeDates") or {}).get("dateOfBirth")
+        age = None
+        if dob:
+            born = dt.date.fromisoformat(dob)
+            age = ref_date.year - born.year - ((ref_date.month, ref_date.day) < (born.month, born.day))
+        image = p.get("portraitUrl")
+        mv = values.get(pid)
+        number = numbers.get(pid)
+        players.append({
+            "id": pid,
+            "name": p.get("displayName") or p.get("name") or "Unknown",
+            "position": position or "Unknown",
+            "group": group,
+            "number": str(number) if number else "",
+            "value": (mv or {}).get("value"),
+            "valueText": api_value_text(mv),
+            "image": image.replace("/portrait/big/", "/portrait/medium/") if image and "default" not in image else None,
+            "age": age,
+            "nationality": None,  # the API only exposes country ids
+            "_order": (GROUP_RANK[group], attrs.get("positionId") or 99),
+        })
+    players.sort(key=lambda p: p.pop("_order"))
+    coach = None
+    if season == current:  # the API only knows the current manager
+        try:
+            coach_id = fetch_tm_api("/club/%s/coach" % club_id).get("coachId")
+            c = fetch_tm_api("/coach/%s" % coach_id) if coach_id else None
+            if c:
+                img = c.get("portraitUrl")
+                coach = {"id": str(c["id"]), "name": c["name"],
+                         "image": img.replace("/portrait/big/", "/portrait/medium/") if img and "default" not in img else None}
+        except ApiError:
+            coach = None
+    rel = club.get("relativeUrl") or "/club/startseite/verein/%s" % club_id
+    return {
+        "id": "%s-%s" % (club_id, season),
+        "clubId": club_id,
+        "name": club.get("name") or "Club %s" % club_id,
+        "season": season,
+        "seasonLabel": season_label(season, True) if split_year else str(season + 1),
+        "crest": club.get("crestUrl"),
+        "url": TM_BASE + rel.replace("/startseite/", "/kader/") + "/saison_id/%d" % season,
+        "players": players,
+        "coach": coach,
+    }
 
 
 # --------------------------------------------------------------------------- LLM proxy
