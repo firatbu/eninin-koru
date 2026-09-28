@@ -48,6 +48,11 @@ Settings, loaded teams and a game in progress are saved in the browser (localSto
 
 Locally nothing changes: without `HOST`/`PORT`, the server only listens on `127.0.0.1`.
 
+Transfermarkt's website blocks most hosting providers (Render gets HTTP 405). When that happens, `server.py` switches to Transfermarkt's JSON API (`tmapi-alpha.transfermarkt.technology`). You get the same squads, positions, shirt numbers and season market values, with these differences:
+- A team takes about 5–15 seconds to load instead of 1–2.
+- Coaches are only available for the current season.
+- Market values for calendar-year leagues (MLS, Brazil, Scandinavia) can differ slightly from the website.
+
 ## Files
 
 - `server.py`: static server, Transfermarkt scraper (`POST /api/team`), LLM proxy (`POST /api/simulate`). Standard library only.
