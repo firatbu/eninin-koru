@@ -565,7 +565,6 @@ function sideHTML(i, results) {
     : "";
   const worth = results ? `<span class="squad-worth">${esc(t("game.squadWorth", { amount: formatEuro(squadValue(squad)) }))}</span>` : "";
   const swapClass = swapSel && swapSel.player === i ? (swapSel.kind === "bench" ? " swap-from-bench" : " swap-from-xi") : "";
-  const hint = swapSel && swapSel.player === i ? `<p class="swap-hint">${esc(t("game.swapHint"))}</p>` : "";
   return `<section class="side s${i}${active ? " active" : ""}${swapClass}" aria-label="${esc(t("game.pitch", { name }))}">
     <div class="side-top">
       <div class="side-name">
@@ -576,7 +575,6 @@ function sideHTML(i, results) {
       ${worth}
       <span class="count">${footballerCount(squad)}/${game.locked.squad}</span>
     </div>
-    ${hint}
     <div class="side-controls">
       <select aria-label="${esc(t("game.formation", { name }))}" data-action="formation" data-player="${i}">${options}</select>
     </div>
@@ -1263,7 +1261,6 @@ function abortDrag() {
 function clearSwapChrome() {
   swapSel = null;
   document.querySelectorAll(".is-selected").forEach((el) => el.classList.remove("is-selected"));
-  document.querySelectorAll(".swap-hint").forEach((el) => el.remove());
   document.querySelectorAll(".side.swap-from-xi, .side.swap-from-bench").forEach((el) => {
     el.classList.remove("swap-from-xi", "swap-from-bench");
   });

@@ -1029,13 +1029,6 @@ body.dragging { user-select: none; cursor: grabbing; }
 
 .lang-switch button { min-width: 2.4rem; padding-left: 8px; padding-right: 8px; }
 
-.swap-hint {
-  margin: 0;
-  font-size: 0.75rem;
-  line-height: 1.25;
-  color: var(--text);
-}
-
 .token.is-selected .face,
 .bench-chip.is-selected {
   box-shadow: 0 0 0 3px #f4f1ea, 0 0 0 6px var(--accent, #8eb6ff);
